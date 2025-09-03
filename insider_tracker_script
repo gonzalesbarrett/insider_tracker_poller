@@ -1,0 +1,279 @@
+#
+# SEC Form 4 Real-Time Insider Trading Scraper
+#
+# This script continuously monitors the SEC's EDGAR RSS feed for new Form 4 filings,
+# which report insider trading activity. When a new filing is detected, the script
+# parses it, scores the significance of the trade based on a set of criteria
+# (e.g., insider's role, trade size), and sends a push notification for
+# high-scoring trades via Pushover.
+#
+# Author: [Your Name/Handle Here]
+# Version: 1.2.0
+# License: MIT
+#
+
+import requests
+import time
+import xml.etree.ElementTree as ET
+import yfinance as yf
+
+# --- CONFIGURATION ---
+
+# The SEC requires a custom User-Agent for all automated scraping.
+# Replace this with your own information to be a good internet citizen.
+# Format: "Your Company/Project Name your-email@example.com"
+SEC_USER_AGENT = "Your Name or Company Name your.email@example.com"
+
+# The minimum "Signal Score" (from 1 to 10) that a trade must have to trigger an alert.
+# A higher number means fewer, but more significant, alerts.
+ALERT_THRESHOLD = 7.0
+
+# The number of seconds the script will wait between checking the SEC feed for new filings.
+POLL_INTERVAL_SECONDS = 60
+
+# --- PUSHOVER NOTIFICATION CONFIGURATION ---
+# To receive push notifications, sign up at https://pushover.net/, create an application,
+# and paste your User Key and API Token below.
+PUSHOVER_USER_KEY = "PASTE_YOUR_USER_KEY_HERE"
+PUSHOVER_API_TOKEN = "PASTE_YOUR_API_TOKEN_HERE"
+
+# --- RUNTIME VARIABLES ---
+
+# This set stores the accession numbers of filings that have already been processed
+# in the current session. This is the script's "short-term memory" and prevents
+# sending duplicate alerts.
+PROCESSED_FILINGS = set()
+
+# --- HELPER FUNCTIONS ---
+
+def make_request(url):
+    """
+    Performs an HTTP GET request with a compliant User-Agent and basic error handling.
+    """
+    headers = {'User-Agent': SEC_USER_AGENT}
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        return response
+    except requests.exceptions.RequestException as e:
+        print(f"Error making request to {url}: {e}")
+        return None
+
+def get_text(element, path, default=''):
+    """
+    Safely retrieves text content from an XML element.
+    """
+    # Define the XML namespace used by the Atom feed.
+    namespaces = {'atom': 'http://www.w3.org/2005/Atom'}
+    node = element.find(path, namespaces)
+    if node is not None:
+        value_node = node.find('value', namespaces)
+        return (value_node.text or default).strip() if value_node is not None else (node.text or default).strip()
+    return default
+
+# --- CORE LOGIC ---
+
+def parse_form4_filing(filing_text, filing_url):
+    """
+    Extracts transaction details from the raw text of a Form 4 filing.
+    This version is more robust at finding the specific XML data block.
+    """
+    try:
+        # Find the start and end of the XML data block.
+        # Some filings use <XML> and </XML> tags to encapsulate the data.
+        xml_start_tag = "<XML>"
+        xml_end_tag = "</XML>"
+        
+        start_index = filing_text.find(xml_start_tag)
+        end_index = filing_text.find(xml_end_tag)
+
+        # If the <XML> tags are present, extract the content between them.
+        if start_index != -1 and end_index != -1:
+            xml_content = filing_text[start_index + len(xml_start_tag):end_index].strip()
+        else:
+            # Fallback for older filings that might just start with <?xml
+            xml_start = filing_text.find('<?xml')
+            if xml_start == -1: return []
+            xml_content = filing_text[xml_start:]
+
+        root = ET.fromstring(xml_content)
+        
+        # Note: The 'get_text' helper for this section does not need namespaces
+        # because this is a different XML document within the filing text.
+        def get_local_text(element, path, default=''):
+            node = element.find(path)
+            if node is not None:
+                value_node = node.find('value')
+                return (value_node.text or default).strip() if value_node is not None else (node.text or default).strip()
+            return default
+
+        owner_cik = get_local_text(root, './reportingOwner/reportingOwnerId/rptOwnerCik')
+        owner_name = get_local_text(root, './reportingOwner/reportingOwnerId/rptOwnerName')
+        issuer_cik = get_local_text(root, './issuer/issuerCik')
+        issuer_name = get_local_text(root, './issuer/issuerName')
+        ticker_symbol = get_local_text(root, './issuer/issuerTradingSymbol')
+        is_director = get_local_text(root, './reportingOwner/reportingOwnerRelationship/isDirector', '0') == '1'
+        is_officer = get_local_text(root, './reportingOwner/reportingOwnerRelationship/isOfficer', '0') == '1'
+        officer_title = get_local_text(root, './reportingOwner/reportingOwnerRelationship/officerTitle')
+
+        transactions = []
+        for transaction in root.findall('.//nonDerivativeTransaction'):
+            transaction_code = get_local_text(transaction, './transactionCoding/transactionCode')
+            if transaction_code not in ['P', 'S']: continue
+            transactions.append({
+                'owner_name': owner_name, 'owner_cik': owner_cik, 'issuer_name': issuer_name,
+                'issuer_cik': issuer_cik, 'ticker_symbol': ticker_symbol, 'is_director': is_director,
+                'is_officer': is_officer, 'officer_title': officer_title,
+                'transaction_date': get_local_text(transaction, './transactionDate'),
+                'transaction_code': transaction_code,
+                'transaction_shares': get_local_text(transaction, './transactionAmounts/transactionShares'),
+                'transaction_price_per_share': get_local_text(transaction, './transactionAmounts/transactionPricePerShare'),
+                'shares_owned_after_transaction': get_local_text(transaction, './postTransactionAmounts/sharesOwnedFollowingTransaction'),
+                'filing_url': filing_url
+            })
+        return transactions
+    except Exception as e:
+        print(f"Error parsing XML for {filing_url}: {e}")
+        return []
+
+def enrich_live_transaction(transaction):
+    """
+    Adds market cap data to a transaction using yfinance.
+    """
+    ticker = transaction.get('ticker_symbol')
+    if not ticker: return transaction
+    try:
+        stock_info = yf.Ticker(ticker).fast_info
+        transaction['market_cap_on_trade_date'] = stock_info.get('marketCap')
+    except Exception as e:
+        print(f"yfinance failed for {ticker}: {e}")
+        transaction['market_cap_on_trade_date'] = 0
+    return transaction
+
+def calculate_signal_score(transaction):
+    """
+    Analyzes a transaction and assigns it a "Signal Score" out of 10.
+    """
+    score = 0
+    reasons = []
+    officer_title = transaction.get('officer_title', '').lower()
+    if any(role in officer_title for role in ['chief executive officer', 'ceo']): score += 4; reasons.append("+4: CEO")
+    elif any(role in officer_title for role in ['chief financial officer', 'cfo']): score += 3; reasons.append("+3: CFO")
+    elif 'chief' in officer_title: score += 2; reasons.append("+2: C-Suite")
+    elif transaction.get('is_director'): score += 1; reasons.append("+1: Director")
+    elif transaction.get('is_officer'): score += 1; reasons.append("+1: Officer")
+    if transaction.get('transaction_code') == 'P': score += 5; reasons.append("+5: Purchase (P)")
+    
+    try:
+        shares = float(transaction.get('transaction_shares', 0))
+        price = float(transaction.get('transaction_price_per_share', 0))
+        owned_after = float(transaction.get('shares_owned_after_transaction', 0))
+        market_cap = float(transaction.get('market_cap_on_trade_date', 0))
+        trade_value = shares * price
+        if trade_value > 1000000: score += 4; reasons.append(f"+4: High Value (>${trade_value:,.0f})")
+        elif trade_value > 250000: score += 2; reasons.append(f"+2: Sig. Value (>${trade_value:,.0f})")
+        elif trade_value > 50000: score += 1; reasons.append(f"+1: Mod. Value (>${trade_value:,.0f})")
+        
+        if transaction.get('transaction_code') == 'P':
+            owned_before = owned_after - shares
+            if owned_before > 0:
+                percent_increase = (shares / owned_before) * 100
+                if percent_increase > 100: score += 6; reasons.append(f"+6: Doubled Holdings (+{percent_increase:.0f}%)")
+                elif percent_increase > 50: score += 4; reasons.append(f"+4: Major Incr. (+{percent_increase:.0f}%)")
+                elif percent_increase > 10: score += 2; reasons.append(f"+2: Sig. Incr. (+{percent_increase:.0f}%)")
+        
+        if market_cap > 0 and (trade_value / market_cap) > 0.001: score += 2; reasons.append("+2: >0.1% of Mkt Cap")
+    except (ValueError, TypeError, ZeroDivisionError):
+        reasons.append("Note: Numeric calc skipped")
+    
+    max_possible_score = 21.0
+    final_score = round((score / max_possible_score) * 10, 1)
+    return final_score, reasons
+
+def send_notification(score, reasons, transaction):
+    """
+    Formats and sends a push notification via the Pushover API.
+    """
+    if not PUSHOVER_USER_KEY or not PUSHOVER_API_TOKEN or "YOUR_" in PUSHOVER_USER_KEY:
+        print("Pushover keys not set. Skipping notification.")
+        return
+    title = f"Insider Alert ({transaction['ticker_symbol']}): Score {score}/10"
+    trade_type = 'Purchase' if transaction['transaction_code'] == 'P' else 'Sale'
+    trade_value = float(transaction.get('transaction_shares', 0)) * float(transaction.get('transaction_price_per_share', 0))
+    message = (
+        f"<b>{transaction['owner_name']}</b> ({transaction.get('officer_title', 'Insider')})\n"
+        f"{trade_type} of <b>${trade_value:,.0f}</b> in {transaction['issuer_name']}\n\n"
+        f"<i>Reasons: {', '.join(reasons)}</i>"
+    )
+    payload = {
+        "token": PUSHOVER_API_TOKEN, "user": PUSHOVER_USER_KEY, "title": title,
+        "message": message, "url": transaction['filing_url'],
+        "url_title": "View SEC Filing", "html": 1
+    }
+    try:
+        response = requests.post("https://api.pushover.net/1/messages.json", data=payload, timeout=10)
+        response.raise_for_status()
+        print(f"Successfully sent notification for {transaction['ticker_symbol']}")
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to send Pushover notification: {e}")
+
+# --- MAIN EXECUTION LOOP ---
+
+if __name__ == "__main__":
+    print("Starting real-time SEC Form 4 Poller...")
+    SEC_FEED_URL = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&count=100&output=atom"
+    
+    while True:
+        try:
+            # 1. Poll the SEC's official RSS feed.
+            response = make_request(SEC_FEED_URL)
+            if not response:
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            # 2. Parse the XML feed content.
+            root = ET.fromstring(response.content)
+            namespaces = {'atom': 'http://www.w3.org/2005/Atom'}
+            
+            # 3. Iterate through each filing ('entry') in the feed.
+            for entry in root.findall('atom:entry', namespaces):
+                id_tag = entry.find('atom:id', namespaces)
+                if id_tag is None: continue
+                
+                accession_number = id_tag.text.split('=')[-1]
+
+                if accession_number not in PROCESSED_FILINGS:
+                    link_tag = entry.find('atom:link', namespaces)
+                    if link_tag is None: continue
+
+                    html_link = link_tag.get('href')
+                    txt_filing_url = html_link.replace('-index.htm', '.txt').replace('.html', '.txt')
+                    
+                    print(f"New Form 4 found: {txt_filing_url}")
+
+                    # 4. Download and parse the full filing text.
+                    filing_response = make_request(txt_filing_url)
+                    if filing_response:
+                        transactions = parse_form4_filing(filing_response.text, txt_filing_url)
+                        
+                        # 5. Process each transaction found in the filing.
+                        for t in transactions:
+                            enriched_t = enrich_live_transaction(t)
+                            score, reasons = calculate_signal_score(enriched_t)
+                            
+                            if score >= ALERT_THRESHOLD:
+                                send_notification(score, reasons, enriched_t)
+
+                    # 6. Add the filing's ID to our set to prevent duplicates.
+                    PROCESSED_FILINGS.add(accession_number)
+            
+            # Trim the memory set to prevent it from growing forever.
+            if len(PROCESSED_FILINGS) > 10000:
+                PROCESSED_FILINGS = set(list(PROCESSED_FILINGS)[-5000:])
+
+        except Exception as e:
+            print(f"An error occurred in the main loop: {e}")
+
+        print(f"Loop finished. Waiting {POLL_INTERVAL_SECONDS} seconds...")
+        time.sleep(POLL_INTERVAL_SECONDS)
+
